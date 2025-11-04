@@ -1,0 +1,27 @@
+[project]
+name = "hrm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.7.0",
+  "torchvision>=0.22.0",
+  "adam-atan2",
+  "einops",
+  "tqdm",
+  "coolname",
+  "pydantic",
+  "argdantic",
+  "wandb",
+  "omegaconf",
+  "hydra-core",
+  "huggingface_hub",
+  "flash-attn",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
