@@ -24,6 +24,7 @@ dependencies = [
   "setuptools",
   "setuptools-scm",
   "flash-attn",
+  "numpy>=2.3.4",
 ]
 
 [[tool.uv.index]]
