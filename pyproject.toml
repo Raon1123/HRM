@@ -24,6 +24,8 @@ dependencies = [
   "setuptools",
   "setuptools-scm",
   "flash-attn",
+  "numpy>=2.3.4",
+  "line-profiler",
 ]
 
 [[tool.uv.index]]
@@ -43,3 +45,5 @@ exclude = ["config*", "assets*", "models*", "dataset*", "utils*"]
 [project.scripts]
 build-sudoku = "hrm.main:build_sudoku"
 train-sudoku = "hrm.main:train_sudoku"
+
+
