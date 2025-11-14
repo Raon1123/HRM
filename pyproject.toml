@@ -28,6 +28,7 @@ dependencies = [
   "line-profiler",
 ]
 
+
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
@@ -38,6 +39,9 @@ requires = [
     "torch>=2.7.0", 
     "torchvision>=0.22.0"
     ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 
 [tool.setuptools.packages.find]
 exclude = ["config*", "assets*", "models*", "dataset*", "utils*"]
