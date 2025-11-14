@@ -11,6 +11,9 @@ import math
 import yaml
 import shutil
 import argparse
+import atexit
+import signal
+import sys
 
 import torch
 import torch.distributed as dist
@@ -20,7 +23,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 import tqdm
 import cProfile
-import wandb
 import coolname
 import hydra
 import pydantic
@@ -31,6 +33,69 @@ try:
     from line_profiler import profile as line_profile
 except ImportError:
     line_profile = lambda f: f
+
+# Globals for profiler objects so atexit / signal handlers can export them
+_GLOBAL_TORCH_PROF = None
+_GLOBAL_CPROFILE = None
+
+
+def _safe_export_profiles():
+    """Stop and export profiler outputs if they exist. Non-throwing.
+
+    This is registered with atexit and invoked on signals to try to
+    flush profiling data (trace.json and profile.prof).
+    """
+    print("Profiling")
+    try:
+        global _GLOBAL_TORCH_PROF, _GLOBAL_CPROFILE
+        if _GLOBAL_TORCH_PROF is not None:
+            try:
+                # Stop if not already stopped
+                _GLOBAL_TORCH_PROF.stop()
+            except Exception:
+                pass
+
+            try:
+                _GLOBAL_TORCH_PROF.export_chrome_trace("trace.json")
+            except Exception:
+                # best-effort, don't raise
+                pass
+
+        if _GLOBAL_CPROFILE is not None:
+            try:
+                _GLOBAL_CPROFILE.disable()
+            except Exception:
+                pass
+            try:
+                _GLOBAL_CPROFILE.dump_stats("profile.prof")
+            except Exception:
+                pass
+    except Exception:
+        # Never raise from the atexit handler
+        try:
+            sys.stderr.write("Failed to export profiles in atexit handler\n")
+        except Exception:
+            pass
+
+
+def _signal_handler(signum, frame):
+    # Try to export profiles then re-raise default behavior
+    try:
+        _safe_export_profiles()
+    finally:
+        # restore default handler and re-raise to allow normal termination
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+
+# Register atexit and common signals early
+atexit.register(_safe_export_profiles)
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    try:
+        signal.signal(sig, _signal_handler)
+    except Exception:
+        # Some signals may not be available on all platforms
+        pass
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -278,75 +343,8 @@ def train_batch(config: ProfileConfig, train_state: TrainState, batch: Any, glob
             return reduced_metrics
 
 
-def evaluate(config: ProfileConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
-    with torch.inference_mode():
-        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
-
-        all_preds = {}
-
-        metric_keys = []
-        metric_values = None
-        metric_global_batch_size = [0 for _ in range(len(set_ids))]
-
-        carry = None
-        for set_name, batch, global_batch_size in eval_loader:
-            # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
-
-            # Forward
-            while True:
-                carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
-
-                if all_finish:
-                    break
-
-            for collection in (batch, preds):
-                for k, v in collection.items():
-                    if k in config.eval_save_outputs:
-                        all_preds.setdefault(k, [])
-                        all_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
-
-            del carry, preds, batch, all_finish
-
-            # Aggregate
-            set_id = set_ids[set_name]
-
-            if metric_values is None:
-                metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
-
-            metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
-            metric_global_batch_size[set_id] += global_batch_size
-
-        if len(all_preds) and config.checkpoint_path is not None:
-            all_preds = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
-
-            os.makedirs(config.checkpoint_path, exist_ok=True)
-            torch.save(all_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}"))
-
-        # Logging
-        # Reduce to rank 0
-        if metric_values is not None:
-            if world_size > 1:
-                dist.reduce(metric_values, dst=0)
-
-            if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
-                                   for set_id, set_name in enumerate(set_ids)}
-
-                # Postprocess
-                for set_name, metrics in reduced_metrics.items():
-                    count = metrics.pop("count")
-                    reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
-
-                return reduced_metrics
-
-
 def save_code_and_config(config: ProfileConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -366,9 +364,6 @@ def save_code_and_config(config: ProfileConfig):
     config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
     with open(config_file, "wt") as f:
         yaml.dump(config.model_dump(), f)
-
-    # Log code
-    wandb.run.log_code(config.checkpoint_path)
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> ProfileConfig:
@@ -414,8 +409,11 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     if RANK == 0:
-        pr = cProfile.Profile()
-        pr.enable()
+        # Start cProfile and keep global reference so it can be exported on exit
+        from cProfile import Profile as _CProfile
+        global _GLOBAL_CPROFILE
+        _GLOBAL_CPROFILE = _CProfile()
+        _GLOBAL_CPROFILE.enable()
 
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
@@ -430,17 +428,16 @@ def launch(hydra_config: DictConfig):
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
 
     if RANK == 0:
-        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True, with_stack=True)
-        prof.start()
+        print("with profile")
+        # Create torch profiler and keep global reference for safe export
+        global _GLOBAL_TORCH_PROF
+        _GLOBAL_TORCH_PROF = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True, with_stack=True)
+        _GLOBAL_TORCH_PROF.start()
 
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
 
     # Training Loop
     try:
@@ -453,43 +450,25 @@ def launch(hydra_config: DictConfig):
                 metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
                 if RANK == 0 and metrics is not None:
-                    wandb.log(metrics, step=train_state.step)
                     progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-
-            ############ Evaluation
-            train_state.model.eval()
-            metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
-
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-
-            ############ Checkpointing
-            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                save_train_state(config, train_state)
     except Exception as e:
         print(f"Training failed with error: {e}")
         # Still export profiles even on failure
         if RANK == 0:
             try:
-                prof.stop()
-                prof.export_chrome_trace("trace.json")
-                pr.disable()
-                pr.dump_stats('profile.prof')
-                print("Profiles exported despite error")
+                _safe_export_profiles()
+                print("Profiles exported despite error (attempted)")
             except:
                 print("Failed to export profiles")
         raise  # Re-raise the original exception
 
+    # Final export (best-effort)
     if RANK == 0:
-        prof.stop()
-        prof.export_chrome_trace("trace.json")
-        pr.disable()
-        pr.dump_stats('profile.prof')
+        _safe_export_profiles()
 
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
 
 
 if __name__ == "__main__":
