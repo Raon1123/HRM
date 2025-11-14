@@ -11,10 +11,10 @@ hydra:
 data_path: data/arc-aug-1000
 
 # Hyperparams - Minimal for profiling
-global_batch_size: 32  # Very small batch for profiling
+global_batch_size: 128  # Very small batch for profiling
 
-epochs: 5  # Only 5 epochs for quick profiling
-eval_interval: 5  # Evaluate every 5 epochs
+epochs: 1  # Only 5 epochs for quick profiling
+eval_interval: 1  # Evaluate every 5 epochs
 checkpoint_every_eval: True
 
 lr: 1e-4

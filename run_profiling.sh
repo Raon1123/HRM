@@ -13,11 +13,11 @@ rm -f trace.json profile.prof *.lprof
 
 # Run profiling with line profiler
 echo "Running profiling with line profiler..."
-uv run kernprof -l profile.py
+uv run kernprof -l profiling.py
 
 # Run normal profiling (generates trace.json and profile.prof)
 echo "Running standard profiling..."
-uv run python profile.py
+uv run python profiling.py
 
 # Analyze results
 echo "Profiling complete! Results:"
